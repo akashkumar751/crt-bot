@@ -1,7 +1,6 @@
 import requests
 import time
 import os
-from datetime import datetime
 
 # 🔐 ENV VARIABLES (set in Railway)
 API_KEY = os.getenv("OANDA_API_KEY")
@@ -49,7 +48,7 @@ def get_candles():
     return data["candles"]
 
 
-# 🧠 CRT logic (2-candle model using ONLY closed candles)
+# 🧠 CRT logic (2-candle sweep/reclaim model using ONLY closed candles)
 def detect_crt(candles):
     completed = [c for c in candles if c["complete"]]
 
@@ -59,20 +58,29 @@ def detect_crt(candles):
     c1 = completed[-2]
     c2 = completed[-1]
 
-    prev_high = float(c1["mid"]["h"])
-    prev_low = float(c1["mid"]["l"])
-    last_close = float(c2["mid"]["c"])
+    h1 = float(c1["mid"]["h"])
+    l1 = float(c1["mid"]["l"])
+    h2 = float(c2["mid"]["h"])
+    l2 = float(c2["mid"]["l"])
+    close2 = float(c2["mid"]["c"])
 
     candle_time = c2["time"]
 
-    print(f"Checking CRT → {c1['time']} vs {c2['time']}")
+    print(
+        f"Checking CRT -> c1:{c1['time']} c2:{c2['time']} "
+        f"| c1(H:{h1},L:{l1}) c2(H:{h2},L:{l2},C:{close2})"
+    )
 
-    # 🟢 Bullish
-    if last_close > prev_high:
+    # 🟢 Bullish CRT:
+    # c2 sweeps below c1 low and closes back above c1 low,
+    # while c1 high remains above c2 high.
+    if l2 < l1 and close2 > l1 and h1 > h2:
         return "🟢 Bullish CRT", candle_time
 
-    # 🔴 Bearish
-    if last_close < prev_low:
+    # 🔴 Bearish CRT:
+    # c2 sweeps above c1 high and closes back below c1 high,
+    # while c1 low remains below c2 low.
+    if h2 > h1 and close2 < h1 and l1 < l2:
         return "🔴 Bearish CRT", candle_time
 
     return None, candle_time
@@ -108,9 +116,7 @@ def main():
 
                 # send alert only once per candle
                 if signal and candle_time != last_candle_time:
-                    time_now = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-
-                    message = f"GOLD/H1 {signal}\nTime: {time_now} UTC"
+                    message = f"GOLD/H1 {signal}"
                     print("🚀 Sending:", message)
 
                     send_telegram(message)
