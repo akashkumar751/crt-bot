@@ -1,6 +1,9 @@
-import requests
-import time
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+
+import requests
 
 # 🔐 ENV VARIABLES (set in Railway)
 API_KEY = os.getenv("OANDA_API_KEY")
@@ -14,8 +17,19 @@ headers = {
     "Authorization": f"Bearer {API_KEY}"
 }
 
-# store last processed candle time (to avoid duplicate alerts)
-last_candle_time = None
+# CRT only needs the last two *completed* candles; latest may still be incomplete.
+CANDLE_COUNT = 4
+
+# Poll shortly after each UTC hour — OANDA H1/H4 align to UTC; no new fully closed bar between hours.
+# Slightly late so `complete` is usually true (increase if alerts lag or are missed).
+POLL_SECONDS_PAST_HOUR = 30
+MIN_SLEEP_SEC = 5.0
+
+# store last processed candle times per timeframe (to avoid duplicate alerts)
+last_candle_time_by_tf = {
+    "H1": None,
+    "H4": None,
+}
 
 
 # Validate required configuration before starting loop
@@ -30,15 +44,15 @@ def validate_env():
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
 
-# 📊 Fetch candles
-def get_candles():
+# 📊 Fetch candles (OANDA allows one granularity per request; reuse session + parallelize H1/H4.)
+def get_candles(session, granularity):
     params = {
-        "granularity": "H1",
-        "count": 5,
-        "price": "M"
+        "granularity": granularity,
+        "count": CANDLE_COUNT,
+        "price": "M",
     }
 
-    r = requests.get(OANDA_URL, headers=headers, params=params, timeout=20)
+    r = session.get(OANDA_URL, params=params, timeout=20)
     data = r.json()
 
     if "candles" not in data:
@@ -46,6 +60,35 @@ def get_candles():
         return []
 
     return data["candles"]
+
+
+def fetch_candles_for_timeframes(session, executor, timeframes):
+    """Both granularities in parallel; executor is reused across loop iterations."""
+    future_to_tf = {
+        executor.submit(get_candles, session, tf): tf for tf in timeframes
+    }
+    out = {}
+    for fut in as_completed(future_to_tf):
+        tf = future_to_tf[fut]
+        out[tf] = fut.result()
+    return out
+
+
+def seconds_until_next_poll_utc(now=None, past_second=POLL_SECONDS_PAST_HOUR):
+    """Sleep until the next fixed UTC slot …:00:30 (if past_second=30).
+
+    Uses the *wall clock* each time (datetime.now(UTC)), not (last_sleep + 1h).
+    The +past_second offset does **not** accumulate — every poll targets the same
+    pattern: 12:00:30, 13:00:30, 14:00:30 UTC, etc.
+    """
+    now = now or datetime.now(timezone.utc)
+    anchor = now.replace(minute=0, second=0, microsecond=0) + timedelta(
+        seconds=past_second
+    )
+    if now <= anchor:
+        return max((anchor - now).total_seconds(), MIN_SLEEP_SEC)
+    next_anchor = anchor + timedelta(hours=1)
+    return max((next_anchor - now).total_seconds(), MIN_SLEEP_SEC)
 
 
 # 🧠 CRT logic (2-candle sweep/reclaim model using ONLY closed candles)
@@ -87,7 +130,7 @@ def detect_crt(candles):
 
 
 # 📤 Send Telegram alert
-def send_telegram(message):
+def send_telegram(session, message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     payload = {
@@ -96,38 +139,51 @@ def send_telegram(message):
     }
 
     try:
-        requests.post(url, json=payload, timeout=20)
+        session.post(url, json=payload, timeout=20)
     except Exception as e:
         print("Telegram Error:", e)
 
 
 def main():
-    global last_candle_time
     validate_env()
-    print("Bot started. Waiting for closed H1 candles...")
+    print(
+        "Bot started. Polling OANDA shortly after each UTC hour "
+        f"(+{POLL_SECONDS_PAST_HOUR}s); H1/H4 fetched in parallel."
+    )
 
-    # 🔁 MAIN LOOP
-    while True:
-        try:
-            candles = get_candles()
+    timeframes = ("H1", "H4")
 
-            if candles:
-                signal, candle_time = detect_crt(candles)
+    with requests.Session() as oanda, requests.Session() as telegram:
+        oanda.headers.update(headers)
 
-                # send alert only once per candle
-                if signal and candle_time != last_candle_time:
-                    message = f"GOLD/H1 {signal}"
-                    print("🚀 Sending:", message)
+        with ThreadPoolExecutor(max_workers=len(timeframes)) as executor:
+            # 🔁 MAIN LOOP
+            while True:
+                try:
+                    candles_by_tf = fetch_candles_for_timeframes(
+                        oanda, executor, timeframes
+                    )
 
-                    send_telegram(message)
+                    for timeframe in timeframes:
+                        candles = candles_by_tf.get(timeframe, [])
 
-                    last_candle_time = candle_time
+                        if candles:
+                            signal, candle_time = detect_crt(candles)
 
-            time.sleep(60)  # check every 1 min
+                            # send alert only once per candle per timeframe
+                            if signal and candle_time != last_candle_time_by_tf[timeframe]:
+                                message = f"GOLD/{timeframe} {signal}"
+                                print("🚀 Sending:", message)
 
-        except Exception as e:
-            print("Error:", e)
-            time.sleep(60)
+                                send_telegram(telegram, message)
+
+                                last_candle_time_by_tf[timeframe] = candle_time
+
+                    time.sleep(seconds_until_next_poll_utc())
+
+                except Exception as e:
+                    print("Error:", e)
+                    time.sleep(MIN_SLEEP_SEC)
 
 
 if __name__ == "__main__":
