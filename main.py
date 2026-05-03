@@ -10,6 +10,12 @@ API_KEY = os.getenv("OANDA_API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Optional — https://www.callmebot.com/blog/free-api-whatsapp-messages/
+# International phone digits only, no + (e.g. 919876543210). Get apikey after linking WhatsApp there.
+WHATSAPP_PHONE = os.getenv("WHATSAPP_PHONE")
+WHATSAPP_APIKEY = os.getenv("WHATSAPP_APIKEY")
+CALLMEBOT_URL = "https://api.callmebot.com/whatsapp/send.php"
+
 # OANDA endpoint (demo)
 OANDA_URL = "https://api-fxpractice.oanda.com/v3/instruments/XAU_USD/candles"
 
@@ -135,16 +141,40 @@ def send_telegram(session, message):
         print("Telegram Error:", e)
 
 
+def send_whatsapp(session, message):
+    if not WHATSAPP_PHONE or not WHATSAPP_APIKEY:
+        return
+    try:
+        r = session.get(
+            CALLMEBOT_URL,
+            params={
+                "phone": WHATSAPP_PHONE,
+                "apikey": WHATSAPP_APIKEY,
+                "text": message,
+            },
+            timeout=20,
+        )
+        snippet = (r.text or "").strip().replace("\n", " ")[:300]
+        if r.status_code != 200:
+            print("WhatsApp Error:", r.status_code, snippet)
+        elif "error" in snippet.lower():
+            print("WhatsApp Error:", snippet)
+    except Exception as e:
+        print("WhatsApp Error:", e)
+
+
 def main():
     validate_env()
     print(
         "Bot started. After each cycle, sleeps until the next UTC minute (:00); "
         "H1/H4 fetched in parallel."
     )
+    if WHATSAPP_PHONE and WHATSAPP_APIKEY:
+        print("WhatsApp alerts enabled (CallMeBot).")
 
     timeframes = ("H1", "H4")
 
-    with requests.Session() as oanda, requests.Session() as telegram:
+    with requests.Session() as oanda, requests.Session() as telegram, requests.Session() as whatsapp:
         oanda.headers.update(headers)
 
         with ThreadPoolExecutor(max_workers=len(timeframes)) as executor:
@@ -167,6 +197,7 @@ def main():
                                 print("🚀 Sending:", message)
 
                                 send_telegram(telegram, message)
+                                send_whatsapp(whatsapp, message)
 
                                 last_candle_time_by_tf[timeframe] = candle_time
 
