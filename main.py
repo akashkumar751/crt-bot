@@ -187,14 +187,10 @@ def main():
                     if alert_lines:
                         for key, candle_time, *_ in alert_lines:
                             last_candle_time_by_instrument_tf[key] = candle_time
-                        header = "CRT · " + " · ".join(
-                            e["label"] for e in WATCHLIST
-                        )
-                        body = "\n".join(
+                        message = "\n".join(
                             f"{label}/{timeframe}: {signal}"
                             for _, _, label, timeframe, signal in alert_lines
                         )
-                        message = f"{header}\n{body}"
                         print("🚀 Sending:", message)
                         send_telegram(telegram, message)
 
