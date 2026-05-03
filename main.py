@@ -10,8 +10,8 @@ API_KEY = os.getenv("OANDA_API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# OANDA endpoint (demo)
-OANDA_URL = "https://api-fxpractice.oanda.com/v3/instruments/XAU_USD/candles"
+# OANDA REST base (demo); instrument is appended per request.
+OANDA_INSTRUMENTS_BASE = "https://api-fxpractice.oanda.com/v3/instruments"
 
 headers = {
     "Authorization": f"Bearer {API_KEY}"
@@ -22,11 +22,14 @@ CANDLE_COUNT = 4
 
 # Wake on each UTC minute boundary (:00) after work — matches OANDA candle time (UTC); no long-term drift.
 
-# store last processed candle times per timeframe (to avoid duplicate alerts)
-last_candle_time_by_tf = {
-    "H1": None,
-    "H4": None,
-}
+# label = Telegram prefix; instrument = OANDA v3 name (e.g. BTC_USD, XAU_USD)
+WATCHLIST = (
+    {"label": "GOLD", "instrument": "XAU_USD", "timeframes": ("H1", "H4")},
+    {"label": "BTCUSD", "instrument": "BTC_USD", "timeframes": ("H4",)},
+)
+
+# last closed candle time per (instrument, timeframe) — avoids duplicate alerts
+last_candle_time_by_instrument_tf = {}
 
 
 # Validate required configuration before starting loop
@@ -41,15 +44,16 @@ def validate_env():
         raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
 
 
-# 📊 Fetch candles (OANDA allows one granularity per request; reuse session + parallelize H1/H4.)
-def get_candles(session, granularity):
+# 📊 Fetch candles (OANDA allows one granularity per request; parallelize per instrument/tf.)
+def get_candles(session, instrument, granularity):
+    url = f"{OANDA_INSTRUMENTS_BASE}/{instrument}/candles"
     params = {
         "granularity": granularity,
         "count": CANDLE_COUNT,
         "price": "M",
     }
 
-    r = session.get(OANDA_URL, params=params, timeout=20)
+    r = session.get(url, params=params, timeout=20)
     data = r.json()
 
     if "candles" not in data:
@@ -59,15 +63,16 @@ def get_candles(session, granularity):
     return data["candles"]
 
 
-def fetch_candles_for_timeframes(session, executor, timeframes):
-    """Both granularities in parallel; executor is reused across loop iterations."""
-    future_to_tf = {
-        executor.submit(get_candles, session, tf): tf for tf in timeframes
+def fetch_candles_jobs(session, executor, jobs):
+    """jobs: tuple of (instrument, granularity); parallel fetch; executor reused each loop."""
+    future_to_key = {
+        executor.submit(get_candles, session, inst, tf): (inst, tf)
+        for inst, tf in jobs
     }
     out = {}
-    for fut in as_completed(future_to_tf):
-        tf = future_to_tf[fut]
-        out[tf] = fut.result()
+    for fut in as_completed(future_to_key):
+        key = future_to_key[fut]
+        out[key] = fut.result()
     return out
 
 
@@ -137,38 +142,61 @@ def send_telegram(session, message):
 
 def main():
     validate_env()
+    jobs = tuple(
+        (entry["instrument"], tf)
+        for entry in WATCHLIST
+        for tf in entry["timeframes"]
+    )
+    max_workers = max(1, len(jobs))
+
     print(
         "Bot started. After each cycle, sleeps until the next UTC minute (:00); "
-        "H1/H4 fetched in parallel."
+        f"{len(jobs)} candle request(s) in parallel."
     )
-
-    timeframes = ("H1", "H4")
 
     with requests.Session() as oanda, requests.Session() as telegram:
         oanda.headers.update(headers)
 
-        with ThreadPoolExecutor(max_workers=len(timeframes)) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 🔁 MAIN LOOP
             while True:
                 try:
-                    candles_by_tf = fetch_candles_for_timeframes(
-                        oanda, executor, timeframes
+                    candles_by_inst_tf = fetch_candles_jobs(
+                        oanda, executor, jobs
                     )
 
-                    for timeframe in timeframes:
-                        candles = candles_by_tf.get(timeframe, [])
+                    alert_lines = []
+                    for entry in WATCHLIST:
+                        label = entry["label"]
+                        instrument = entry["instrument"]
+                        for timeframe in entry["timeframes"]:
+                            candles = candles_by_inst_tf.get(
+                                (instrument, timeframe), []
+                            )
 
-                        if candles:
-                            signal, candle_time = detect_crt(candles)
+                            if candles:
+                                signal, candle_time = detect_crt(candles)
 
-                            # send alert only once per candle per timeframe
-                            if signal and candle_time != last_candle_time_by_tf[timeframe]:
-                                message = f"GOLD/{timeframe} {signal}"
-                                print("🚀 Sending:", message)
+                                key = (instrument, timeframe)
+                                prev = last_candle_time_by_instrument_tf.get(key)
+                                if signal and candle_time != prev:
+                                    alert_lines.append(
+                                        (key, candle_time, label, timeframe, signal)
+                                    )
 
-                                send_telegram(telegram, message)
-
-                                last_candle_time_by_tf[timeframe] = candle_time
+                    if alert_lines:
+                        for key, candle_time, *_ in alert_lines:
+                            last_candle_time_by_instrument_tf[key] = candle_time
+                        header = "CRT · " + " · ".join(
+                            e["label"] for e in WATCHLIST
+                        )
+                        body = "\n".join(
+                            f"{label}/{timeframe}: {signal}"
+                            for _, _, label, timeframe, signal in alert_lines
+                        )
+                        message = f"{header}\n{body}"
+                        print("🚀 Sending:", message)
+                        send_telegram(telegram, message)
 
                     sleep_until_next_utc_minute()
 
