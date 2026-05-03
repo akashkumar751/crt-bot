@@ -20,10 +20,7 @@ headers = {
 # CRT only needs the last two *completed* candles; latest may still be incomplete.
 CANDLE_COUNT = 4
 
-# Poll shortly after each UTC hour — OANDA H1/H4 align to UTC; no new fully closed bar between hours.
-# Slightly late so `complete` is usually true (increase if alerts lag or are missed).
-POLL_SECONDS_PAST_HOUR = 30
-MIN_SLEEP_SEC = 5.0
+# Wake on each UTC minute boundary (:00) after work — matches OANDA candle time (UTC); no long-term drift.
 
 # store last processed candle times per timeframe (to avoid duplicate alerts)
 last_candle_time_by_tf = {
@@ -74,21 +71,15 @@ def fetch_candles_for_timeframes(session, executor, timeframes):
     return out
 
 
-def seconds_until_next_poll_utc(now=None, past_second=POLL_SECONDS_PAST_HOUR):
-    """Sleep until the next fixed UTC slot …:00:30 (if past_second=30).
-
-    Uses the *wall clock* each time (datetime.now(UTC)), not (last_sleep + 1h).
-    The +past_second offset does **not** accumulate — every poll targets the same
-    pattern: 12:00:30, 13:00:30, 14:00:30 UTC, etc.
-    """
-    now = now or datetime.now(timezone.utc)
-    anchor = now.replace(minute=0, second=0, microsecond=0) + timedelta(
-        seconds=past_second
-    )
-    if now <= anchor:
-        return max((anchor - now).total_seconds(), MIN_SLEEP_SEC)
-    next_anchor = anchor + timedelta(hours=1)
-    return max((next_anchor - now).total_seconds(), MIN_SLEEP_SEC)
+def sleep_until_next_utc_minute():
+    """Sleep until the start of the next calendar UTC minute (e.g. work ends 10:00:45 → wake ~10:01:00)."""
+    now = datetime.now(timezone.utc)
+    nxt = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    delay = (nxt - now).total_seconds()
+    if delay < 0.05:
+        nxt += timedelta(minutes=1)
+        delay = (nxt - now).total_seconds()
+    time.sleep(delay)
 
 
 # 🧠 CRT logic (2-candle sweep/reclaim model using ONLY closed candles)
@@ -147,8 +138,8 @@ def send_telegram(session, message):
 def main():
     validate_env()
     print(
-        "Bot started. Polling OANDA shortly after each UTC hour "
-        f"(+{POLL_SECONDS_PAST_HOUR}s); H1/H4 fetched in parallel."
+        "Bot started. After each cycle, sleeps until the next UTC minute (:00); "
+        "H1/H4 fetched in parallel."
     )
 
     timeframes = ("H1", "H4")
@@ -179,11 +170,11 @@ def main():
 
                                 last_candle_time_by_tf[timeframe] = candle_time
 
-                    time.sleep(seconds_until_next_poll_utc())
+                    sleep_until_next_utc_minute()
 
                 except Exception as e:
                     print("Error:", e)
-                    time.sleep(MIN_SLEEP_SEC)
+                    sleep_until_next_utc_minute()
 
 
 if __name__ == "__main__":
