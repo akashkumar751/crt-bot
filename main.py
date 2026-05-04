@@ -24,7 +24,7 @@ CANDLE_COUNT = 4
 
 # label = Telegram prefix; instrument = OANDA v3 name (e.g. BTC_USD, XAU_USD)
 WATCHLIST = (
-    {"label": "GOLD", "instrument": "XAU_USD", "timeframes": ("H1", "H4")},
+    {"label": "GOLD", "instrument": "XAU_USD", "timeframes": ("M15", "H1", "H4")},
     {"label": "BTCUSD", "instrument": "BTC_USD", "timeframes": ("H4",)},
 )
 
